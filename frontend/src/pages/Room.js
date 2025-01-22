@@ -48,66 +48,72 @@ const Room = () => {
   useEffect(() => {
     const initializeCall = async () => {
       try {
-        console.log('Starting call initialization...');
-        if (!userId) {
-          throw new Error('User ID not initialized');
-        }
+        // Initialize local stream and peer connection
         const localStream = await CloudflareCallsService.initialize(userId, roomId);
-        console.log('Got local stream, setting up video...');
         setLocalStream(localStream);
+        
         if (videoRef.current) {
           videoRef.current.srcObject = localStream;
         }
 
-        // Lắng nghe sự kiện người dùng mới tham gia
+        // Join room to get remote streams
+        await CloudflareCallsService.joinRoom(roomId);
+
+        // Listen for new participants
         CloudflareCallsService.on('participantJoined', (participant) => {
-          console.log('New participant joined:', participant);
-          setParticipants(prev => new Map(prev.set(participant.userId, participant)));
+          console.log('New participant:', participant);
+          if (participant.stream) {
+            setParticipants(prev => {
+              const newMap = new Map(prev);
+              newMap.set(participant.userId, {
+                id: participant.userId,
+                stream: participant.stream,
+                active: true
+              });
+              return newMap;
+            });
+          }
         });
 
-        // Lắng nghe sự kiện người dùng rời phòng
-        CloudflareCallsService.on('participantLeft', (participant) => {
-          console.log('Participant left:', participant);
-          setParticipants(prev => {
-            const newMap = new Map(prev);
-            newMap.delete(participant.userId);
-            return newMap;
-          });
-        });
       } catch (error) {
         console.error('Error initializing call:', error);
         setError(error.message);
       }
     };
 
-    initializeCall();
+    if (userId && roomId) {
+      initializeCall();
+    }
+
     return () => {
-      console.log('Cleaning up...');
       CloudflareCallsService.leaveRoom();
     };
-  }, [roomId, userId]);
+  }, [userId, roomId]);
 
-  useEffect(() => {
-    CloudflareCallsService.on('participantJoined', ({userId, stream}) => {
-      console.log('Participant joined with stream:', stream?.getTracks().length);
-      setParticipants(prev => new Map(prev.set(userId, {
-        id: userId,
-        stream: stream
-      })));
-    });
-
-    CloudflareCallsService.on('participantLeft', ({userId}) => {
-      setParticipants(prev => {
-        const newMap = new Map(prev);
-        newMap.delete(userId);
-        return newMap;
+  // Add function to handle video elements
+  const handleVideoElement = (el, participant) => {
+    if (el && participant.stream && el.srcObject !== participant.stream) {
+      console.log(`Setting up video for participant ${participant.id}`, {
+        tracks: participant.stream.getTracks().map(t => t.kind),
+        active: participant.stream.active
       });
-    });
 
-    return () => {
-      CloudflareCallsService.leaveRoom();
-    };
-  }, []);
+      el.srcObject = participant.stream;
+      el.muted = participant.id === userId; // Mute only local video
+      
+      el.onloadedmetadata = () => {
+        console.log(`Video metadata loaded for participant ${participant.id}`);
+        el.play().catch(error => {
+          console.error('Error playing video:', error);
+        });
+      };
+
+      // Add error handling
+      el.onerror = (error) => {
+        console.error(`Video error for participant ${participant.id}:`, error);
+      };
+    }
+  };
 
   const toggleAudio = () => {
     CloudflareCallsService.toggleAudio(!isMuted);
@@ -130,7 +136,10 @@ const Room = () => {
   const handleJoinRoom = async () => {
     try {
       if (!userId) {
-        throw new Error('User ID not initialized');
+        const tempUserId = 'user_' + Math.random().toString(36).substr(2, 9);
+        localStorage.setItem('userId', tempUserId);
+        setUserId(tempUserId);
+        return; // Exit early to allow state update
       }
       await CloudflareCallsService.initialize(userId, roomId);
       console.log('Joined room successfully');
@@ -170,32 +179,61 @@ const Room = () => {
         <Grid item xs={isChatOpen ? 9 : 12}>
           <VideoGrid>
             {/* Local video */}
-            <Paper elevation={3} sx={{ position: 'relative', height: '100%' }}>
+            <Paper elevation={3} sx={{ 
+              position: 'relative', 
+              height: '100%', 
+              backgroundColor: 'black',
+              overflow: 'hidden'
+            }}>
               <video
                 ref={videoRef}
                 autoPlay
-                muted
                 playsInline
-                style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                muted
+                style={{
+                  width: '100%',
+                  height: '100%',
+                  objectFit: 'contain',
+                  transform: isVideoOff ? 'none' : 'scaleX(-1)'
+                }}
               />
             </Paper>
             {/* Remote participants */}
             {Array.from(participants.values()).map((participant) => (
-              <Paper key={participant.id} elevation={3} sx={{ position: 'relative', height: '100%' }}>
+              <Paper 
+                key={participant.id} 
+                elevation={3} 
+                sx={{ 
+                  position: 'relative', 
+                  height: '100%',
+                  backgroundColor: 'black',
+                  overflow: 'hidden'
+                }}
+              >
                 <video
                   autoPlay
-                  playsInline 
-                  ref={(el) => {
-                    if (el && participant.stream) {
-                      console.log(`Setting stream for participant ${participant.id}`);
-                      el.srcObject = participant.stream;
-                      el.play().catch(error => 
-                        console.error('Error playing video:', error)
-                      );
-                    }
+                  playsInline
+                  ref={(el) => handleVideoElement(el, participant)}
+                  style={{ 
+                    width: '100%',
+                    height: '100%',
+                    objectFit: 'contain'
                   }}
-                  style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                 />
+                {/* Add participant name overlay */}
+                <Box
+                  sx={{
+                    position: 'absolute',
+                    bottom: 8,
+                    left: 8,
+                    color: 'white',
+                    bgcolor: 'rgba(0, 0, 0, 0.5)',
+                    padding: '4px 8px',
+                    borderRadius: 1,
+                  }}
+                >
+                  {participant.id}
+                </Box>
               </Paper>
             ))}
           </VideoGrid>

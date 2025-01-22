@@ -1,351 +1,153 @@
-class CallsApp {
-  constructor(appId, appSecret) {
-    this.appId = appId;
-    this.appSecret = appSecret;
-    this.baseUrl = '/cloudflare/client/v4';
-  }
-
-  async sendRequest(endpoint, options = {}) {
-    const url = `${this.baseUrl}${endpoint}`;
-    console.log('Sending request to:', url, options);
-
-    try {
-      const response = await fetch(url, {
-        ...options,
-        headers: {
-          'Content-Type': 'application/json',
-          ...options.headers
-        }
-      });
-
-      if (!response.ok) {
-        const errorData = await response.text();
-        console.error('Response error:', errorData);
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const data = await response.json();
-      console.log('Response data:', data);
-      return data;
-    } catch (error) {
-      console.error('API request failed:', error);
-      throw error;
-    }
-  }
-
-  async createStream(roomId) {
-    return this.sendRequest(`/accounts/${this.appId}/stream/live_inputs`, {
-      method: 'POST',
-      body: JSON.stringify({
-        meta: { name: roomId },
-        settings: {
-          recording: { mode: "automatic" },
-          allowedOrigins: ["*"]
-        }
-      })
-    });
-  }
-
-  async getStreamKey(streamId) {
-    return this.sendRequest(`/accounts/${this.appId}/stream/live_inputs/${streamId}/keys`, {
-      method: 'POST'
-    });
-  }
-}
-
 class CloudflareCallsService {
   constructor() {
+    this.APP_ID = "fc7fdab8c9f9250624fa046ee52c3c5d";
+    this.APP_TOKEN = "2d503c1e7b2fd21bfee9ea52c967593b04ce352fc2ceb55031f3f41e6a9dd149";
+    this.API_BASE = "https://rtc.live.cloudflare.com/v1/apps";
+    this.peerConnection = null;
     this.localStream = null;
-    this.peerConnections = new Map();
+    this.sessionId = null;
     this.eventListeners = new Map();
-    this.ws = null;
-    this.wsBaseUrl = window.location.hostname;
-  }
-
-  async getMediaStream() {
-    try {
-      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        console.log('Using modern getUserMedia API');
-        return await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: true
-        });
-      }
-      
-      console.log('Falling back to legacy getUserMedia');
-      // Fallback cho các trình duyệt cũ
-      const getUserMedia = navigator.getUserMedia ||
-                          navigator.webkitGetUserMedia ||
-                          navigator.mozGetUserMedia ||
-                          navigator.msGetUserMedia;
-      
-      if (!getUserMedia) {
-        console.error('No getUserMedia support');
-        throw new Error('Your browser does not support camera/microphone access');
-      }
-
-      return new Promise((resolve, reject) => {
-        getUserMedia.call(navigator, 
-          { video: true, audio: true },
-          stream => resolve(stream),
-          error => {
-            console.error('getUserMedia error:', error);
-            reject(error);
-          }
-        );
-      });
-    } catch (error) {
-      console.error('Error getting media stream:', error);
-      if (error.name === 'NotAllowedError') {
-        throw new Error('Camera/microphone access was denied. Please allow access in your browser settings.');
-      }
-      throw error;
-    }
-  }
-
-  async getTurnCredentials() {
-    try {
-      const response = await fetch('/api/turn-credentials');
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('TURN credentials error:', errorText);
-        throw new Error(`Failed to get TURN credentials: ${response.status}`);
-      }
-      return response.json();
-    } catch (error) {
-      console.error('Error fetching TURN credentials:', error);
-      throw error;
-    }
   }
 
   async initialize(userId, roomId) {
-    if (!userId) {
-      throw new Error('userId is required');
-    }
-
     try {
-      await this.closeWebSocket();
+      if (this.peerConnection) {
+        console.log('Cleaning up existing connection...');
+        await this.leaveRoom();
+      }
 
-      const wsProtocol = 'ws:';
-      const wsUrl = `${wsProtocol}//${window.location.hostname}:8080/ws?userId=${userId}&roomId=${roomId}`;
-      
-      console.log('Connecting to WebSocket:', wsUrl);
-      this.ws = new WebSocket(wsUrl);
-      
-      this.ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
-      };
-
-      await new Promise((resolve, reject) => {
-        this.ws.onopen = () => {
-          console.log('WebSocket connection established');
-          resolve();
-        };
-        this.ws.onerror = (error) => {
-          console.error('WebSocket connection error:', error);
-          reject(new Error('WebSocket connection failed'));
-        };
+      // 1. Get local stream
+      this.localStream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true
       });
 
-      console.log('WebSocket connected successfully');
+      // 2. Create peer connection
+      this.peerConnection = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }],
+        bundlePolicy: 'max-bundle'
+      });
 
-      this.ws.onmessage = async (event) => {
-        console.log('Received WebSocket message:', event.data);
-        const message = JSON.parse(event.data);
-        switch (message.type) {
-          case 'user-joined':
-            console.log('User joined event received:', message);
-            await this.handleUserJoined(message.userId);
-            break;
-          case 'user-left':
-            console.log('User left event received:', message);
-            this.handleUserLeft(message.userId);
-            break;
-          case 'offer':
-            console.log('Offer received:', message);
-            await this.handleOffer(message.userId, message.offer);
-            break;
-          case 'answer':
-            console.log('Answer received:', message);
-            await this.handleAnswer(message.userId, message.answer);
-            break;
-          case 'ice-candidate':
-            console.log('ICE candidate received:', message);
-            await this.handleIceCandidate(message.userId, message.candidate);
-            break;
-        }
+      // 3. Add tracks to peer connection
+      const tracks = this.localStream.getTracks();
+      for (const track of tracks) {
+        console.log('Adding track:', track.kind);
+        this.peerConnection.addTrack(track, this.localStream);
+      }
+
+      // 4. Create and set local offer
+      const offer = await this.peerConnection.createOffer();
+      console.log('Setting local description...');
+      await this.peerConnection.setLocalDescription(offer);
+
+      // 5. Create new session with Cloudflare
+      console.log('Creating Cloudflare session...');
+      const sessionResponse = await fetch(`${this.API_BASE}/${this.APP_ID}/sessions/new`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.APP_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          sessionDescription: {
+            type: 'offer',
+            sdp: this.peerConnection.localDescription.sdp
+          }
+        })
+      });
+
+      const data = await sessionResponse.json();
+      if (!data.sessionId) {
+        throw new Error('Failed to get session ID from Cloudflare');
+      }
+
+      this.sessionId = data.sessionId;
+      console.log('Session created:', this.sessionId);
+
+      // 6. Set remote description from Cloudflare
+      if (data.sessionDescription) {
+        console.log('Setting remote description from session...');
+        await this.peerConnection.setRemoteDescription(
+          new RTCSessionDescription(data.sessionDescription)
+        );
+      }
+
+      // 7. Handle remote tracks
+      this.peerConnection.ontrack = (event) => {
+        console.log('Remote track received:', event.track.kind);
+        const remoteStream = new MediaStream([event.track]);
+        this.emitEvent('participantJoined', {
+          userId: roomId,
+          stream: remoteStream
+        });
       };
 
-      this.ws.onclose = () => {
-        console.log('WebSocket connection closed');
+      // 8. Handle connection state changes
+      this.peerConnection.onconnectionstatechange = () => {
+        console.log('Connection state:', this.peerConnection.connectionState);
       };
 
-      this.localStream = await this.getMediaStream();
-
-      const turnConfig = await this.getTurnCredentials();
-      console.log('Got TURN config:', turnConfig);
-
-      this.iceServers = [{
-        urls: turnConfig.iceServers.urls,
-        username: turnConfig.iceServers.username,
-        credential: turnConfig.iceServers.credential
-      }];
+      this.peerConnection.oniceconnectionstatechange = () => {
+        console.log('ICE connection state:', this.peerConnection.iceConnectionState);
+      };
 
       return this.localStream;
+
     } catch (error) {
       console.error('Error in initialize:', error);
+      await this.leaveRoom();
       throw error;
     }
   }
 
-  async handleUserJoined(userId) {
-    console.log('User joined:', userId);
+  async joinRoom(roomId) {
     try {
-      const pc = await this.createPeerConnection(userId);
-      
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      if (!this.sessionId || !this.peerConnection) {
+        throw new Error('Must initialize before joining room');
+      }
 
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      console.log('Sending offer to:', userId);
-      this.sendMessage({
-        type: 'offer',
-        targetUserId: userId,
-        offer: offer
+      console.log('Joining room:', roomId);
+      const response = await fetch(`${this.API_BASE}/${this.APP_ID}/sessions/${this.sessionId}/tracks/new`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.APP_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          tracks: [{
+            location: 'remote',
+            sessionId: roomId
+          }]
+        })
       });
-    } catch (error) {
-      console.error('Error in handleUserJoined:', error);
-    }
-  }
 
-  async handleUserLeft(userId) {
-    console.log('User left:', userId);
-    if (this.peerConnections.has(userId)) {
-      this.peerConnections.get(userId).close();
-      this.peerConnections.delete(userId);
-    }
-    this.emitEvent('participantLeft', { userId });
-  }
+      const data = await response.json();
+      
+      if (data.requiresImmediateRenegotiation) {
+        console.log('Renegotiation required...');
+        await this.peerConnection.setRemoteDescription(
+          new RTCSessionDescription(data.sessionDescription)
+        );
 
-  async handleOffer(userId, offer) {
-    console.log('Handling offer from:', userId);
-    try {
-      const pc = await this.createPeerConnection(userId);
-      console.log('Setting remote description...');
-      await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      
-      console.log('Creating answer...');
-      const answer = await pc.createAnswer();
-      
-      console.log('Setting local description...');
-      await pc.setLocalDescription(answer);
-      
-      console.log('Sending answer to:', userId);
-      this.sendMessage({
-        type: 'answer',
-        targetUserId: userId,
-        answer: answer
-      });
-    } catch (error) {
-      console.error('Error handling offer:', error);
-    }
-  }
+        const answer = await this.peerConnection.createAnswer();
+        await this.peerConnection.setLocalDescription(answer);
 
-  async handleAnswer(userId, answer) {
-    console.log('Received answer from:', userId);
-    try {
-      const pc = this.peerConnections.get(userId);
-      if (pc) {
-        console.log('Current signaling state:', pc.signalingState);
-        
-        // Chỉ set remote description nếu peer connection đang ở trạng thái have-local-offer
-        if (pc.signalingState === 'have-local-offer') {
-          console.log('Setting remote description:', answer);
-          await pc.setRemoteDescription(new RTCSessionDescription(answer));
-          console.log('Answer processed successfully');
-        } else {
-          console.warn('Peer connection not in correct state for setting remote description');
-          console.warn('Current state:', pc.signalingState);
-        }
-      } else {
-        console.warn('No peer connection found for user:', userId);
+        await fetch(`${this.API_BASE}/${this.APP_ID}/sessions/${this.sessionId}/renegotiate`, {
+          method: 'PUT',
+          headers: {
+            'Authorization': `Bearer ${this.APP_TOKEN}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            sessionDescription: {
+              type: 'answer',
+              sdp: answer.sdp
+            }
+          })
+        });
       }
     } catch (error) {
-      console.error('Error handling answer:', error);
-    }
-  }
-
-  async handleIceCandidate(userId, candidate) {
-    console.log('Received ICE candidate for:', userId);
-    const pc = this.peerConnections.get(userId);
-    if (pc) {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
-    }
-  }
-
-  async createPeerConnection(userId) {
-    console.log('Creating peer connection for user:', userId);
-    const configuration = {
-      iceServers: this.iceServers,
-      iceTransportPolicy: 'all',
-      bundlePolicy: 'max-bundle',
-      rtcpMuxPolicy: 'require',
-      // Enable unified plan for consistent behavior
-      sdpSemantics: 'unified-plan'
-    };
-
-    const pc = new RTCPeerConnection(configuration);
-    
-    // Add local tracks
-    this.localStream.getTracks().forEach(track => {
-      console.log('Adding local track to peer connection:', track.kind);
-      pc.addTrack(track, this.localStream);
-    });
-
-    // Improved ontrack handler
-    pc.ontrack = (event) => {
-      console.log('Received remote track:', event.track.kind);
-      if (!event.streams || !event.streams[0]) {
-        console.warn('No streams in track event');
-        return;
-      }
-      
-      const remoteStream = event.streams[0];
-      console.log('Remote stream tracks:', remoteStream.getTracks().length);
-      
-      this.emitEvent('participantJoined', {
-        userId: userId,
-        stream: remoteStream
-      });
-    };
-
-    // Log ICE connection state changes
-    pc.oniceconnectionstatechange = () => {
-      console.log(`ICE connection state for ${userId}:`, pc.iceConnectionState);
-    };
-
-    this.peerConnections.set(userId, pc);
-    return pc;
-  }
-
-  sendMessage(message) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      console.log('Sending message:', message);
-      this.ws.send(JSON.stringify(message));
-    } else {
-      console.error('WebSocket is not open. ReadyState:', this.ws?.readyState);
-    }
-  }
-
-  async startScreenShare() {
-    try {
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-      });
-      await this.room.publishStream(screenStream, { type: 'screen' });
-      return screenStream;
-    } catch (error) {
-      console.error('Error sharing screen:', error);
+      console.error('Error joining room:', error);
       throw error;
     }
   }
@@ -357,12 +159,6 @@ class CloudflareCallsService {
     this.eventListeners.get(eventName).add(callback);
   }
 
-  off(eventName, callback) {
-    if (this.eventListeners.has(eventName)) {
-      this.eventListeners.get(eventName).delete(callback);
-    }
-  }
-
   emitEvent(eventName, data) {
     if (this.eventListeners.has(eventName)) {
       this.eventListeners.get(eventName).forEach(callback => callback(data));
@@ -370,64 +166,26 @@ class CloudflareCallsService {
   }
 
   async leaveRoom() {
-    try {
-      console.log('Leaving room...');
-      for (const [userId, pc] of this.peerConnections) {
-        pc.close();
-        this.peerConnections.delete(userId);
-      }
-
-      if (this.localStream) {
-        this.localStream.getTracks().forEach(track => track.stop());
-        this.localStream = null;
-      }
-
-      await this.closeWebSocket();
-      console.log('Left room successfully');
-    } catch (error) {
-      console.error('Error leaving room:', error);
-    }
-  }
-
-  async toggleAudio(enabled) {
-    if (this.localStream) {
-      const audioTrack = this.localStream.getAudioTracks()[0];
-      if (audioTrack) {
-        audioTrack.enabled = enabled;
-      }
-    }
-  }
-
-  async toggleVideo(enabled) {
-    if (this.localStream) {
-      const videoTrack = this.localStream.getVideoTracks()[0];
-      if (videoTrack) {
-        videoTrack.enabled = enabled;
-      }
-    }
-  }
-
-  async closeWebSocket() {
-    if (this.ws) {
-      return new Promise((resolve) => {
-        const ws = this.ws;
-        this.ws = null;
-
-        if (ws.readyState === WebSocket.CLOSED) {
-          resolve();
-          return;
-        }
-
-        ws.onclose = () => {
-          console.log('WebSocket closed successfully');
-          resolve();
-        };
-
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.close();
+    if (this.sessionId) {
+      await fetch(`${this.API_BASE}/${this.APP_ID}/sessions/${this.sessionId}`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${this.APP_TOKEN}`
         }
       });
     }
+
+    if (this.peerConnection) {
+      this.peerConnection.close();
+      this.peerConnection = null;
+    }
+
+    if (this.localStream) {
+      this.localStream.getTracks().forEach(track => track.stop());
+      this.localStream = null;
+    }
+
+    this.sessionId = null;
   }
 }
 

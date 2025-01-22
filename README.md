@@ -1,5 +1,14 @@
 # Hệ Thống Phòng Họp Trực Tuyến
 
+## Lỗi đang gặp phải.
+
+### WebRTC Connection Errors
+
+#### Failed to execute 'setRemoteDescription' on 'RTCPeerConnection'
+Lỗi: "Failed to set remote answer sdp: Called in wrong state: stable"
+
+# Hệ Thống Phòng Họp Trực Tuyến
+
 Hệ thống phòng họp trực tuyến cho phép người dùng tạo và tham gia các phòng họp video với các tính năng như chat, chia sẻ màn hình và điều khiển âm thanh/video.
 
 ## Kiến Trúc Hệ Thống
